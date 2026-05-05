@@ -1,36 +1,34 @@
 ;;! target = "x86_64"
 
-;; This test checks that we do *not* get the indirect-call caching optimization
-;; when it is not enabled, because it is off by default.
+;; Counterpart to `call-indirect-immutable-elide-sig.wat`. Same module
+;; shape — same elem segment, same uniform call-site type — but one
+;; function writes to the table via `table.set`. That sets the
+;; `tables_mutated` bit and disables sig-check elision.
 ;;
-;; The key bit in the expectation below is that the call sequence in
-;; `u0:3` below goes straight to the bounds-check (v5), lazy-table
-;; init (masking of bits with v13), and loading of the funcref fields
-;; in block3, with no caching fastpath.
-;;
-;; A `(table.set)` is included to disable the immutable-funcref
-;; sig-check / null-check elision. Without that mutation, the table
-;; would be eligible for that separate optimization and the dispatch
-;; expectation would not reflect the canonical "no caching, no
-;; immutable-table elision" baseline this test is meant to pin.
+;; Look for the runtime sig load + compare on the call site:
+;;   load.i32 user6 aligned readonly v_+16
+;;   icmp eq
+;;   trapz user7
+;; (versus the elided form in the immutable test).
 
 (module
- (table 10 10 funcref)
+  (table 10 10 funcref)
 
- (func $f1 (result i32) i32.const 1)
- (func $f2 (result i32) i32.const 2)
- (func $f3 (result i32) i32.const 3)
+  (func $f1 (result i32) i32.const 1)
+  (func $f2 (result i32) i32.const 2)
+  (func $f3 (result i32) i32.const 3)
 
- (func (export "mutate") (param i32)
-  local.get 0
-  ref.func $f1
-  table.set 0)
+  ;; Mutator: this clears the immutability proof for table 0.
+  (func (export "mutate") (param i32)
+    local.get 0
+    ref.func $f1
+    table.set 0)
 
- (func (export "call_it") (param i32) (result i32)
-  local.get 0
-  call_indirect (result i32))
+  (func (export "call_it") (param i32) (result i32)
+    local.get 0
+    call_indirect (result i32))
 
- (elem (i32.const 1) func $f1 $f2 $f3))
+  (elem (i32.const 0) func $f1 $f2 $f3))
 ;; function u0:0(i64 vmctx, i64) -> i32 tail {
 ;;     gv0 = vmctx
 ;;     gv1 = load.i64 notrap aligned readonly gv0+8

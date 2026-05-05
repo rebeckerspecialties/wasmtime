@@ -5,6 +5,14 @@
 ;; by constructing a single WebAssembly funcref table, initializing it with an
 ;; element section, and never writing to it again. This test tracks what code
 ;; we generate for that pattern.
+;;
+;; The expected `block3` below contains only the funcref code/vmctx
+;; loads — the runtime sig load + compare is elided because the table
+;; is provably immutable and every populated slot has the same module-
+;; interned signature as the call site (commit 3 of the
+;; table-mutability-tracking series). The funcref-NULL trap is kept
+;; (`load.i64 user6 ...`) because the elem segment only covers slot 1
+;; of the size-2 table — slot 0 is null at runtime.
 
 ;; Motivated by https://github.com/bytecodealliance/wasmtime/issues/8195
 
@@ -48,13 +56,13 @@
 ;; @0031                               v9 = iconst.i64 0
 ;; @0031                               v6 = load.i64 notrap aligned readonly can_move v0+48
 ;; @0031                               v5 = uextend.i64 v2
-;;                                     v26 = iconst.i64 3
-;; @0031                               v7 = ishl v5, v26  ; v26 = 3
+;;                                     v21 = iconst.i64 3
+;; @0031                               v7 = ishl v5, v21  ; v21 = 3
 ;; @0031                               v8 = iadd v6, v7
 ;; @0031                               v10 = select_spectre_guard v4, v9, v8  ; v9 = 0
 ;; @0031                               v11 = load.i64 user5 aligned table v10
-;;                                     v25 = iconst.i64 -2
-;; @0031                               v12 = band v11, v25  ; v25 = -2
+;;                                     v20 = iconst.i64 -2
+;; @0031                               v12 = band v11, v20  ; v20 = -2
 ;; @0031                               brif v11, block3(v12), block2
 ;;
 ;;                                 block2 cold:
@@ -63,14 +71,9 @@
 ;; @0031                               jump block3(v17)
 ;;
 ;;                                 block3(v13: i64):
-;; @0031                               v21 = load.i32 user6 aligned readonly v13+16
-;; @0031                               v19 = load.i64 notrap aligned readonly can_move v0+40
-;; @0031                               v20 = load.i32 notrap aligned readonly can_move v19
-;; @0031                               v22 = icmp eq v21, v20
-;; @0031                               trapz v22, user7
-;; @0031                               v23 = load.i64 notrap aligned readonly v13+8
-;; @0031                               v24 = load.i64 notrap aligned readonly v13+24
-;; @0031                               call_indirect sig0, v23(v24, v0)
+;; @0031                               v18 = load.i64 user6 aligned readonly v13+8
+;; @0031                               v19 = load.i64 notrap aligned readonly v13+24
+;; @0031                               call_indirect sig0, v18(v19, v0)
 ;; @0034                               jump block1
 ;;
 ;;                                 block1:
