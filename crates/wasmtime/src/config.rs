@@ -2420,6 +2420,18 @@ impl Config {
         // has never heard of them.
         let features_known_to_wasmtime = WasmFeatures::WASM3
             | WasmFeatures::SHARED_EVERYTHING_THREADS
+            // LEGACY_EXCEPTIONS is officially deprecated upstream
+            // ("internal use with the spec testsuite, may be removed
+            // at any time") but is the only way to LOAD wasm produced
+            // by Porffor and similar JS-to-wasm compilers that emit
+            // the legacy (phase-3) try / catch / throw tag opcodes
+            // rather than the new try_table / throw_ref form. Adding
+            // LEGACY_EXCEPTIONS to the known-features list lets the
+            // public `Config::wasm_legacy_exceptions(true)` API
+            // actually take effect through Config::validate, instead
+            // of bailing with "feature not supported on this compiler
+            // configuration" the moment it's enabled.
+            | WasmFeatures::LEGACY_EXCEPTIONS
             | WasmFeatures::COMPONENT_MODEL
             | WasmFeatures::CUSTOM_PAGE_SIZES
             | WasmFeatures::STACK_SWITCHING
