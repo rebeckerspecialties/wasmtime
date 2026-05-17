@@ -460,6 +460,36 @@ where
             }
         }
     }
+
+    // Debug-only structural invariant: each continuation block we're about
+    // to absorb loads from must have exactly one predecessor (the brif that
+    // matched the pattern). If a second predecessor reaches the
+    // continuation, its control-flow path would observe the absorbed
+    // load destinations as uninitialized — exactly the bug the
+    // trap-on-null handler fix defends against. Building
+    // `ControlFlowGraph` is O(n) so we gate the whole thing on
+    // `#[cfg(debug_assertions)]`; the assertion + CFG construction
+    // compile to nothing in release builds (no runtime overhead).
+    #[cfg(debug_assertions)]
+    if !to_sink.is_empty() {
+        let cfg = crate::flowgraph::ControlFlowGraph::with_function(ctx.f);
+        for (l_code, _) in &to_sink {
+            let cont = ctx
+                .f
+                .layout
+                .inst_block(*l_code)
+                .expect("absorbed load belongs to a block");
+            let n_preds = cfg.pred_iter(cont).count();
+            debug_assert_eq!(
+                n_preds, 1,
+                "pulley funcref-dispatch fusion absorbs continuation-block \
+                 loads, so the continuation must have exactly one predecessor \
+                 (the brif being lowered); found {} predecessors for {:?}",
+                n_preds, cont
+            );
+        }
+    }
+
     for (l_code, l_vmctx) in to_sink {
         ctx.sink_pure_inst(l_code);
         ctx.sink_pure_inst(l_vmctx);
