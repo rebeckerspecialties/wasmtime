@@ -2449,15 +2449,25 @@ impl OpVisitor for Interpreter<'_> {
     ) -> ControlFlow<Done> {
         // `src` is the ALREADY-MASKED funcref (`band v, -2` upstream — the
         // band stays as a separate Pulley op; this fusion absorbs only the
-        // brif + the two field loads). The branch fires when src != 0,
-        // matching the brif's original semantics in the eager-init
-        // predicate's IR rewrite (`brif value_masked, taken, null`). Under
-        // the predicate `src` is never zero at runtime, but the handler
-        // still has to match the brif's null fall-through as
-        // defence-in-depth.
+        // brif + the two field loads from the continuation block). The
+        // branch fires when src != 0, matching the brif's original
+        // semantics in the eager-init predicate's IR rewrite
+        // (`brif value_masked, continuation, null`).
+        //
+        // The null path TRAPS rather than falling through to the original
+        // lazy-init `null_block`. The fusion absorbed the continuation
+        // block's loads into this op, so the slow path's
+        // `null_block → lazy_init → jump continuation([returned_entry])`
+        // edge now lands in a continuation block whose loads are gone —
+        // call_indirect there would see uninitialized dst_code/dst_vmctx.
+        // The fusion is gated on `is_eagerly_initialized_funcref_table`,
+        // which guarantees `src != 0` at runtime, so trapping here is
+        // unreachable in correct code. If we ever do reach it (predicate
+        // bug, runtime invariant violation), we fail closed with a clean
+        // trap rather than misdispatching.
         let s = self.state[src].get_u64();
         if s == 0 {
-            ControlFlow::Continue(())
+            self.done_trap::<crate::XfuncrefDispatchX64>()
         } else {
             // SAFETY: under the eager-init predicate, the wasmtime runtime
             // enforces that the funcref slot contains a real VMFuncRef
@@ -2482,9 +2492,15 @@ impl OpVisitor for Interpreter<'_> {
         offset_vmctx: i8,
         offset: PcRelOffset,
     ) -> ControlFlow<Done> {
+        // Inverted form: fast path falls through, null path used to
+        // branch to `offset`. After the trap-on-null fix the branch
+        // target is dead — `offset` is kept in the encoding only for
+        // bytecode-shape compatibility with the forward variant. See
+        // `xfuncref_dispatch_x64` for the soundness rationale.
+        let _ = offset;
         let s = self.state[src].get_u64();
         if s == 0 {
-            self.pc_rel_jump::<crate::XfuncrefDispatchNotX64>(offset)
+            self.done_trap::<crate::XfuncrefDispatchNotX64>()
         } else {
             let base = s as *const u8;
             unsafe {
@@ -2508,7 +2524,7 @@ impl OpVisitor for Interpreter<'_> {
     ) -> ControlFlow<Done> {
         let s = self.state[src].get_u32();
         if s == 0 {
-            ControlFlow::Continue(())
+            self.done_trap::<crate::XfuncrefDispatchX32>()
         } else {
             let base = s as usize as *const u8;
             unsafe {
@@ -2530,9 +2546,10 @@ impl OpVisitor for Interpreter<'_> {
         offset_vmctx: i8,
         offset: PcRelOffset,
     ) -> ControlFlow<Done> {
+        let _ = offset;
         let s = self.state[src].get_u32();
         if s == 0 {
-            self.pc_rel_jump::<crate::XfuncrefDispatchNotX32>(offset)
+            self.done_trap::<crate::XfuncrefDispatchNotX32>()
         } else {
             let base = s as usize as *const u8;
             unsafe {
@@ -2558,10 +2575,15 @@ impl OpVisitor for Interpreter<'_> {
         // Phase-3 fusion: combines the standalone xband64_s8 (mask init
         // bit) with the phase-2 brif+xload+xload dispatch into one op.
         // The masked value is written unconditionally to dst_masked so
-        // the brif's block-call-arg machinery still finds it; the two
-        // loads only fire on the non-null side. Soundness under the
-        // eager-init predicate: `src` is provably non-zero at runtime,
-        // so the loads are valid memory accesses.
+        // the brif's block-call-arg machinery still finds it.
+        //
+        // The null path TRAPS rather than falling through to the original
+        // `null_block`. See `xfuncref_dispatch_x64` for the rationale: the
+        // fusion absorbed the continuation block's loads, so the slow
+        // path's rejoin to the continuation would see uninitialized
+        // dst_code/dst_vmctx. Gated on `is_eagerly_initialized_funcref_table`,
+        // so `src != 0` at runtime; trapping here is unreachable in correct
+        // code but fails closed if the runtime invariant is ever violated.
         let s = self.state[src].get_u64();
         let masked = s & !1u64;
         self.state[dst_masked].set_u64(masked);
@@ -2575,7 +2597,7 @@ impl OpVisitor for Interpreter<'_> {
             }
             self.pc_rel_jump::<crate::XbandFuncrefDispatchX64>(offset)
         } else {
-            ControlFlow::Continue(())
+            self.done_trap::<crate::XbandFuncrefDispatchX64>()
         }
     }
 
@@ -2589,11 +2611,13 @@ impl OpVisitor for Interpreter<'_> {
         offset_vmctx: i8,
         offset: PcRelOffset,
     ) -> ControlFlow<Done> {
+        // Inverted form; `offset` is vestigial after the trap-on-null fix.
+        let _ = offset;
         let s = self.state[src].get_u64();
         let masked = s & !1u64;
         self.state[dst_masked].set_u64(masked);
         if s == 0 {
-            self.pc_rel_jump::<crate::XbandFuncrefDispatchNotX64>(offset)
+            self.done_trap::<crate::XbandFuncrefDispatchNotX64>()
         } else {
             let base = masked as *const u8;
             unsafe {
@@ -2629,7 +2653,7 @@ impl OpVisitor for Interpreter<'_> {
             }
             self.pc_rel_jump::<crate::XbandFuncrefDispatchX32>(offset)
         } else {
-            ControlFlow::Continue(())
+            self.done_trap::<crate::XbandFuncrefDispatchX32>()
         }
     }
 
@@ -2643,11 +2667,12 @@ impl OpVisitor for Interpreter<'_> {
         offset_vmctx: i8,
         offset: PcRelOffset,
     ) -> ControlFlow<Done> {
+        let _ = offset;
         let s = self.state[src].get_u32();
         let masked = s & !1u32;
         self.state[dst_masked].set_u32(masked);
         if s == 0 {
-            self.pc_rel_jump::<crate::XbandFuncrefDispatchNotX32>(offset)
+            self.done_trap::<crate::XbandFuncrefDispatchNotX32>()
         } else {
             let base = masked as usize as *const u8;
             unsafe {
