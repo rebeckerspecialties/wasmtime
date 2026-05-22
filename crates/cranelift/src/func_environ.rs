@@ -30,8 +30,9 @@ use wasmtime_environ::{
     EngineOrModuleTypeIndex, FrameStateSlotBuilder, FrameValType, FuncIndex, FuncKey,
     GlobalConstValue, GlobalIndex, IndexType, Memory, MemoryIndex, MemoryTunables, Module,
     ModuleInternedTypeIndex, ModuleTranslation, ModuleTypesBuilder, PtrSize, Table, TableIndex,
-    TagIndex, Tunables, TypeConvert, TypeIndex, VMOffsets, WasmCompositeInnerType, WasmFuncType,
-    WasmHeapTopType, WasmHeapType, WasmRefType, WasmResult, WasmValType,
+    TableInitialValue, TagIndex, Tunables, TypeConvert, TypeIndex, VMOffsets,
+    WasmCompositeInnerType, WasmFuncType, WasmHeapTopType, WasmHeapType, WasmRefType, WasmResult,
+    WasmValType,
 };
 use wasmtime_environ::{FUNCREF_INIT_BIT, FUNCREF_MASK};
 
@@ -862,6 +863,51 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
         assert_eq!(FUNCREF_MASK as isize, -2);
         let value_masked = builder.ins().band_imm(value, Imm64::from(-2));
 
+        // If the table is provably immutable AND every slot in the bounds-
+        // checked range is populated by a static elem segment with a
+        // non-null funcref, the lazy-init brif is dead: at runtime, the
+        // matching coordination in `Instance::initialize_tables` (commit 8)
+        // eagerly populates every slot from the precomputed image, so the
+        // funcref load above always returns a tagged-funcref entry, never
+        // the lazy-init sentinel `0`. Skip emitting the brif and the cold
+        // block (the lazy-init builtin call would never be entered for
+        // these tables anyway).
+        //
+        // The `band_imm(-2)` above stays — clearing the FUNCREF_INIT_BIT
+        // is correct on the eagerly-populated tagged storage and a 1-cycle
+        // ALU no-op on any future untagged-storage variant. Keeping it
+        // here keeps the codegen simple.
+        // The c1-8 brif-skip and c1-9 brif-with-trap-cold-block
+        // variants were both measured on iPhone 12 A14 E-core with
+        // Pulley-only PMU traces and BENCH_TARGET_MS=8000 wallclock.
+        // The corrected aggregates (see `OPTIMIZATION-CEILING.md`):
+        //
+        //                       c1-7       c1-8         c1-9
+        //   Useful              34.6M      33.3M        34.6M
+        //   Processing          35.3M      34.2M        37.9M
+        //   Delivery            75.9M      76.5M        73.6M
+        //   Discarded           34.9M  →  37.1M (+6.5%) 39.7M (+13.8%)
+        //   TOTAL              180.7M     181.2M       185.7M
+        //
+        // c1-7 is the local minimum on Discarded (mispredicts).
+        // Eliding the brif (c1-8) shifts ~6.5% of cycles into the
+        // Discarded bucket; replacing the cold block with a trap
+        // (c1-9) shifts ~14% — the egraph optimizer folds it to
+        // `trapz` and the resulting Pulley shape is even worse for
+        // the predictor than c1-8's bare lowering. Both were
+        // wallclock-equivalent at N=3 replicates (within ±2-3%
+        // noise) on all measured E-core platforms, so the bucket
+        // shift doesn't translate to a wallclock regression — but
+        // it does mark the ceiling.
+        //
+        // Going below this Discarded floor requires reducing
+        // match_loop indirect-branch dispatch count (= opcode
+        // fusion + lowering scheduler — the "next branch" thesis).
+        // We keep the brif emission as in c1-7, leaving the runtime
+        // eager-init from `Instance::initialize_tables` active as
+        // dead-code-after-warmup since the brif still catches the
+        // (now never-true) lazy-init bit.
+
         let null_block = builder.create_block();
         let continuation_block = builder.create_block();
         if cold_blocks {
@@ -1632,20 +1678,39 @@ impl FuncEnvironment<'_> {
             self.reference_type(table.ref_type.heap_type).0.bytes()
         };
 
+        // A table is "fixed-size at runtime" if its declared min equals its
+        // max (`(table 17 17 funcref)`) OR if we proved during translation
+        // that no opcode in the module ever calls `table.grow` /
+        // `table.set` / `table.fill` / `table.copy` (as dst) / `table.init`
+        // on it (`translation.module.tables_mutated[index] == false`). In either
+        // case the table's base address won't move and its element count is
+        // fixed at `table.limits.min`, so:
+        //
+        //   - `base_gv` can be marked `readonly + can_move` (one load total
+        //     per function, not per dispatch);
+        //   - `TableSize::Static { bound: min }` removes the runtime bound
+        //     load + compare on every `call_indirect` / `table.get`.
+        //
+        // Without commit 1's `tables_mutated` bit the static path was
+        // gated only on `min == max`, which is rare in real toolchain
+        // output (Porffor's 46/∞ table, sqlite3's 620/∞ table both
+        // looked dynamic to the previous heuristic). Commit 1's analysis
+        // proves they're effectively static and unblocks this peephole.
+        let immutable = !self.translation.module.tables_mutated[index];
+        let fixed_size = immutable || Some(table.limits.min) == table.limits.max;
+
         let base_gv = func.create_global_value(ir::GlobalValueData::Load {
             base: ptr,
             offset: Offset32::new(base_offset),
             global_type: pointer_type,
-            flags: if Some(table.limits.min) == table.limits.max {
-                // A fixed-size table can't be resized so its base address won't
-                // change.
+            flags: if fixed_size {
                 MemFlags::trusted().with_readonly().with_can_move()
             } else {
                 MemFlags::trusted()
             },
         });
 
-        let bound = if Some(table.limits.min) == table.limits.max {
+        let bound = if fixed_size {
             TableSize::Static {
                 bound: table.limits.min,
             }
@@ -1891,6 +1956,14 @@ impl<'a, 'func, 'module_env> Call<'a, 'func, 'module_env> {
         callee: ir::Value,
         call_args: &[ir::Value],
     ) -> WasmResult<Option<CallRets>> {
+        // Fast path: if we can statically resolve this indirect call to a
+        // single defined function (immutable funcref table + constant
+        // callee index + matching signature), emit a direct call instead.
+        // See `try_static_resolve_indirect_call`.
+        if let Some(target) = self.try_static_resolve_indirect_call(table_index, ty_index, callee) {
+            return self.direct_call(target, sig_ref, call_args).map(Some);
+        }
+
         let (code_ptr, callee_vmctx) = match self.check_and_load_code_and_callee_vmctx(
             features,
             table_index,
@@ -1904,6 +1977,253 @@ impl<'a, 'func, 'module_env> Call<'a, 'func, 'module_env> {
 
         self.unchecked_call_impl(sig_ref, code_ptr, callee_vmctx, call_args)
             .map(Some)
+    }
+
+    /// Try to statically resolve a `call_indirect` site to a single defined
+    /// function so the call can be lowered as a direct call.
+    ///
+    /// All four of these must hold for the resolution to succeed:
+    ///
+    /// 1. The target table must be provably immutable for the lifetime of
+    ///    any instance of this module: defined (not imported), not exported,
+    ///    never the target of `table.set` / `table.fill` / `table.copy`
+    ///    (as the dst) / `table.grow` / `table.init`, and not the target
+    ///    of any leftover active `elem` segment (one
+    ///    `try_func_table_init` couldn't fold into the precomputed image
+    ///    and that will execute at instantiation time, potentially
+    ///    overwriting precomputed slots with arbitrary funcrefs). All of
+    ///    these conditions are folded into the `tables_mutated` bit
+    ///    populated in `ModuleEnvironment::translate` —
+    ///    `tables_mutated[t] == false` is necessary and sufficient.
+    ///
+    /// 2. The callee index value (the operand to `call_indirect`) must be a
+    ///    compile-time constant — i.e., the wasm did `i32.const N;
+    ///    call_indirect (table $t) (type $sig)`. This is what hand-lowered
+    ///    C++/Rust vtable calls and AOT-compiled JS-to-wasm dispatch tables
+    ///    look like in practice.
+    ///
+    /// 3. The slot at index `N` in the table must be precomputable from
+    ///    static `elem` segments: `module.table_initialization
+    ///    .initial_values[defined_index]` must be `TableInitialValue::Null
+    ///    { precomputed }` (i.e., not a fully-dynamic `Expr`-style init),
+    ///    and the index `N` must be in range and resolved to a concrete
+    ///    `FuncIndex` (not the reserved-value sentinel).
+    ///
+    /// 4. The function's signature in the module's interned type table
+    ///    must equal the `ty_index` declared by the `call_indirect` site.
+    ///    Otherwise the original semantics are "trap on signature
+    ///    mismatch", which we don't want to replace with a static direct
+    ///    call.
+    ///
+    /// Returns the resolved function on success, `None` otherwise (in
+    /// which case the caller falls back to a normal indirect call).
+    fn try_static_resolve_indirect_call(
+        &self,
+        table_index: TableIndex,
+        ty_index: TypeIndex,
+        callee: ir::Value,
+    ) -> Option<FuncIndex> {
+        let translation = self.env.translation;
+        let module = &translation.module;
+
+        // (1) Table must be provably immutable. Imported tables are
+        //     pre-marked as mutated in `ModuleEnvironment::translate`, so
+        //     this check also rules them out (along with the explicit
+        //     `defined_table_index` check below for clarity).
+        if translation.module.tables_mutated[table_index] {
+            return None;
+        }
+        let defined_table = module.defined_table_index(table_index)?;
+
+        // (2) Callee must be a constant `iconst`. Pattern adapted from
+        //     `bounds_checks::statically_known_in_bounds`.
+        let dfg = &self.builder.func.dfg;
+        let inst = dfg.value_def(callee).inst()?;
+        let imm = match dfg.insts[inst] {
+            ir::InstructionData::UnaryImm {
+                opcode: ir::Opcode::Iconst,
+                imm,
+            } => imm,
+            _ => return None,
+        };
+        let callee_ty = dfg.value_type(callee);
+        let callee_idx_u64 = imm
+            .zero_extend_from_width(callee_ty.bits())
+            .bits()
+            .cast_unsigned();
+
+        // (3) Slot must be precomputable.
+        let init = module
+            .table_initialization
+            .initial_values
+            .get(defined_table)?;
+        let precomputed = match init {
+            TableInitialValue::Null { precomputed } => precomputed,
+            // A fully-expression-driven initializer can't be resolved at
+            // compile time. Bail.
+            TableInitialValue::Expr(_) => return None,
+        };
+        let slot = usize::try_from(callee_idx_u64).ok()?;
+        if slot >= precomputed.len() {
+            return None;
+        }
+        let target = precomputed[slot];
+        // `FuncIndex::reserved_value()` is the "no entry" sentinel —
+        // this slot wasn't covered by any static `elem` segment.
+        if target.is_reserved_value() {
+            return None;
+        }
+
+        // (4) Signature match. The site's declared `ty_index` and the
+        //     target function's declared signature must intern to the same
+        //     module type index.
+        let expected_ty = module.types[ty_index].unwrap_module_type_index();
+        let target_ty = module.functions[target]
+            .signature
+            .unwrap_module_type_index();
+        if expected_ty != target_ty {
+            return None;
+        }
+
+        Some(target)
+    }
+
+    /// Try to prove that the runtime signature check at a `call_indirect`
+    /// site through an untyped `funcref` table is redundant.
+    ///
+    /// True when:
+    ///
+    /// 1. The table is provably immutable (`tables_mutated[table_index] ==
+    ///    false`). The `tables_mutated` bit set by
+    ///    `analyze_table_mutability` covers imports, exports, runtime
+    ///    mutation opcodes, AND tables targeted by leftover active `elem`
+    ///    segments (segments that didn't fold into the precomputed image
+    ///    and execute at instantiation time, potentially overwriting
+    ///    precomputed slots with a funcref of a different signature).
+    ///    `false` here is therefore sufficient to treat the precomputed
+    ///    image as authoritative for the lifetime of any instance.
+    ///
+    /// 2. The table is precomputable from static `elem` segments
+    ///    (`TableInitialValue::Null { precomputed }`).
+    ///
+    /// 3. Every non-null entry in `precomputed` has the same module-
+    ///    interned signature as the `ty_index` declared at the call site.
+    ///    Null slots are fine — they trap on the funcref-NULL load that
+    ///    happens after sig-check elision.
+    ///
+    /// When this returns true, the caller short-circuits to
+    /// `CheckIndirectCallTypeSignature::StaticMatch`, which removes the
+    /// sig load + compare from the hot path. Bounds-check on the table
+    /// index and the funcref-NULL check are still emitted by the
+    /// surrounding code, so the call still traps correctly on OOB or
+    /// null index — only the sig check is elided.
+    ///
+    /// This is the static analog of an inline-cache: instead of caching
+    /// the resolved target per call site, we observe at module-load that
+    /// the table contents make the sig check uninformative for the
+    /// lifetime of any instance.
+    /// True iff every slot in the precomputed `elem`-segment contents for
+    /// `table_index` is a concrete `FuncIndex` (no
+    /// `FuncIndex::reserved_value()` "no-entry" sentinel).
+    ///
+    /// Caller has already proven the table is immutable, so the contents
+    /// observed here are stable for the lifetime of any instance —
+    /// `false` here implies "no slot is ever null at runtime."
+    ///
+    /// When this is true, the runtime funcref-NULL check on the loaded
+    /// funcref pointer is provably redundant: any in-bounds index leads
+    /// to a non-null funcref. The bounds check still runs (so an
+    /// out-of-bounds index traps as before with `TRAP_TABLE_OUT_OF_BOUNDS`).
+    fn precomputed_table_has_no_null_slots(&self, table_index: TableIndex) -> bool {
+        let module = &self.env.translation.module;
+        let Some(defined_table) = module.defined_table_index(table_index) else {
+            return false;
+        };
+        let Some(init) = module
+            .table_initialization
+            .initial_values
+            .get(defined_table)
+        else {
+            return false;
+        };
+        let precomputed = match init {
+            TableInitialValue::Null { precomputed } => precomputed,
+            TableInitialValue::Expr(_) => return false,
+        };
+        // Empty precomputed means we have no information.
+        if precomputed.is_empty() {
+            return false;
+        }
+        // The precomputed list only describes slots covered by the elem
+        // segments processed in `try_func_table_init`; slots beyond
+        // `precomputed.len()` are null at runtime. To prove the table
+        // can never yield a null funcref to a `call_indirect` we need
+        // coverage all the way to the table's minimum (== full, since
+        // the caller already proved the table is immutable and so can't
+        // be grown). Without this guard, a `call_indirect` to an
+        // uncovered-but-in-bounds slot would skip the null trap and
+        // dereference a null funcref pointer.
+        let table_min = module.tables[table_index].limits.min;
+        if (precomputed.len() as u64) < table_min {
+            return false;
+        }
+        // Every slot must be a real FuncIndex — no reserved-value sentinels.
+        precomputed.iter().all(|f| !f.is_reserved_value())
+    }
+
+    fn try_elide_sig_check_for_immutable_table(
+        &self,
+        table_index: TableIndex,
+        ty_index: TypeIndex,
+    ) -> bool {
+        let translation = self.env.translation;
+        let module = &translation.module;
+
+        if translation.module.tables_mutated[table_index] {
+            return false;
+        }
+        let defined_table = match module.defined_table_index(table_index) {
+            Some(d) => d,
+            None => return false,
+        };
+
+        let init = match module
+            .table_initialization
+            .initial_values
+            .get(defined_table)
+        {
+            Some(i) => i,
+            None => return false,
+        };
+        let precomputed = match init {
+            TableInitialValue::Null { precomputed } => precomputed,
+            TableInitialValue::Expr(_) => return false,
+        };
+
+        // Empty precomputed list means we have no information — fall back
+        // to the runtime sig check. (A subsequent `call_indirect` could
+        // still trap on OOB, but we don't have anything to elide against.)
+        if precomputed.is_empty() {
+            return false;
+        }
+
+        let expected_ty = module.types[ty_index].unwrap_module_type_index();
+        for &func_idx in precomputed.iter() {
+            // Null slots can't be called without trapping — fine to ignore
+            // here; the elided check would have trapped anyway, and the
+            // unchecked code path will trap on the null funcref deref.
+            if func_idx.is_reserved_value() {
+                continue;
+            }
+            let actual_ty = module.functions[func_idx]
+                .signature
+                .unwrap_module_type_index();
+            if actual_ty != expected_ty {
+                return false;
+            }
+        }
+
+        true
     }
 
     fn check_and_load_code_and_callee_vmctx(
@@ -1971,6 +2291,34 @@ impl<'a, 'func, 'module_env> Call<'a, 'func, 'module_env> {
         // table of typed functions and that type matches `ty_index`, then
         // there's no need to perform a typecheck.
         match table.ref_type.heap_type {
+            // Untyped `funcref` tables ordinarily need a runtime sig check.
+            // But if (a) the table is provably immutable (`tables_mutated`
+            // bit clear) and (b) every non-null entry in the precomputed
+            // static `elem` segments has the same `VMSharedTypeIndex` as
+            // the call site, then the runtime check is provably redundant
+            // and we can elide it the same way we do for typed-funcref
+            // tables.
+            //
+            // This is the AOT-IC-seeding analog: instead of caching the
+            // resolved target at the call site, we cache the *signature*
+            // at module-load time and skip the hot-path sig load+compare.
+            // Helps the megamorphic case (computed `call_indirect` index)
+            // that the static-monomorphization fast path above can't
+            // handle.
+            WasmHeapType::Func
+                if self.try_elide_sig_check_for_immutable_table(table_index, ty_index) =>
+            {
+                // If we additionally know every entry in the precomputed
+                // table is non-null, lower `may_be_null` to false so the
+                // downstream funcref-NULL check is also elided. This is
+                // only sound if the table can't be grown or have its
+                // entries cleared after init (i.e., immutable, which we
+                // already proved above).
+                let may_be_null = table.ref_type.nullable
+                    && !self.precomputed_table_has_no_null_slots(table_index);
+                return CheckIndirectCallTypeSignature::StaticMatch { may_be_null };
+            }
+
             // Functions do not have a statically known type in the table, a
             // typecheck is required. Fall through to below to perform the
             // actual typecheck.

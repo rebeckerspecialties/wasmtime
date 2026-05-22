@@ -77,6 +77,18 @@ pub struct ModuleTranslation<'data> {
     /// trampolines for each of these signatures are required.
     pub exported_signatures: Vec<ModuleInternedTypeIndex>,
 
+    /// Per-table flag indicating whether the table is ever mutated by any
+    /// function defined in this module via `table.set` / `table.fill` /
+    /// `table.copy` (as the destination) / `table.grow` / `table.init`.
+    ///
+    // The per-table mutability bit lives on `Module::tables_mutated` so
+    // that the bit survives serialization to `ModuleArtifacts` and is
+    // therefore visible at instance creation time (commit 8 reads it
+    // from the runtime to decide whether to eagerly populate
+    // precomputed funcref-table images). Use
+    // `translation.module.tables_mutated[idx]` instead of a separate
+    // field on `ModuleTranslation`.
+
     /// DWARF debug information, if enabled, parsed from the module.
     pub debuginfo: DebugInfoData<'data>,
 
@@ -238,6 +250,36 @@ impl<'a, 'data> ModuleEnvironment<'a, 'data> {
         for payload in parser.parse_all(data) {
             self.translate_payload(payload?)?;
         }
+
+        // Precompute static funcref-table contents from `elem` segments
+        // before Cranelift lowering runs. The redundant call later in
+        // `wasmtime/src/compile.rs::build_module_artifacts` is a no-op
+        // once this has run (the segments list is already drained).
+        //
+        // This used to only happen *after* Cranelift compilation, which
+        // meant the `table_initialization.initial_values[*].precomputed`
+        // list was empty when `func_environ.rs` checked it for the
+        // `call_indirect` optimizations introduced in the prior commits
+        // (constant-index → direct call, sig-check elision on uniform-
+        // typed immutable tables, funcref-NULL elision on no-null
+        // immutable tables). Those optimizations all bailed out at the
+        // empty-precomputed check, never firing on real workloads —
+        // their measured improvements in earlier commit messages were
+        // measurement noise, not real signal.
+        //
+        // Folded segments are removed from `table_initialization
+        // .segments`; whatever's left is genuinely deferred to runtime.
+        // We do this BEFORE `analyze_table_mutability` so that the
+        // mutability analyzer can mark "tables with leftover segments"
+        // as conservatively mutated — leftover segments overwrite
+        // precomputed slots at instantiation time and so make the
+        // precomputed image non-authoritative for downstream call_
+        // indirect elisions. See `analyze_table_mutability`'s body.
+        if self.tunables.table_lazy_init {
+            self.result.try_func_table_init();
+        }
+
+        analyze_table_mutability(&mut self.result)?;
 
         Ok(self.result)
     }
@@ -1347,4 +1389,122 @@ impl ModuleTranslation<'_> {
         }
         self.module.table_initialization.segments = segments.try_collect().panic_on_oom();
     }
+}
+
+/// Walk every defined function body, recording in
+/// `translation.tables_mutated` each table that is the destination of any
+/// runtime mutation opcode (`table.set`, `table.fill`, `table.copy` as the
+/// destination, `table.grow`, `table.init`).
+///
+/// Imported tables are conservatively pre-marked as mutated since the
+/// importer can mutate them in ways we can't see. Exported tables are
+/// also pre-marked: a host (or another instance importing the export)
+/// can `Table::set` / `Table::grow` them via the public wasmtime API,
+/// and those writes aren't visible in this module's bytecode.
+///
+/// **Active `elem` segments**: only those that `try_func_table_init`
+/// successfully folded into `table_initialization.initial_values[t]
+/// .precomputed` are part of the table's *initial* state and don't
+/// count as mutations. Anything still left in `table_initialization
+/// .segments` after that pass is a *leftover segment* that runs at
+/// instantiation time and can overwrite slots the precomputed image
+/// describes — including writing a different `FuncIndex`, a function
+/// of a different signature, or a null. Downstream `call_indirect`
+/// elisions in `crates/cranelift/src/func_environ.rs`
+/// (`try_static_resolve_indirect_call`,
+/// `try_elide_sig_check_for_immutable_table`,
+/// `precomputed_table_has_no_null_slots`) read directly from
+/// `precomputed`, so leftover segments make those reads
+/// non-authoritative. We mark every such target table as mutated to
+/// kill the elisions on it. (`try_func_table_init` must therefore have
+/// already run when we reach this function — the call site in
+/// `translate` enforces that ordering.)
+///
+/// `elem.drop` drops a passive element segment but does not write to any
+/// table directly, so it is intentionally not counted here. Conservatively,
+/// any `table.init` from a passive segment marks the destination table as
+/// mutated.
+fn analyze_table_mutability<'data>(translation: &mut ModuleTranslation<'data>) -> Result<()> {
+    // Resize the table-mutability map to cover every table in the module
+    // (imports + defined). `SecondaryMap` defaults to `false` for all
+    // unset entries, which is the correct "definitely-not-mutated" default
+    // for defined tables we haven't observed any mutations on yet.
+    let num_tables = translation.module.tables.len();
+    if num_tables == 0 {
+        return Ok(());
+    }
+
+    // Mark all imported tables as mutated up front. The importer can
+    // mutate them in ways this module can't see, so the conservative
+    // assumption is that they are not stable across calls.
+    let num_imported = translation.module.num_imported_tables;
+    for i in 0..num_imported {
+        translation.module.tables_mutated[TableIndex::from_u32(i as u32)] = true;
+    }
+
+    // Mark all *exported* tables as mutated as well. A host (or another
+    // instance importing the export) can call `Table::set` /
+    // `Table::grow` via the public wasmtime API on any exported table,
+    // and those mutations are not visible in this module's bytecode.
+    // The `call_indirect` optimizations that read this bit must
+    // therefore treat exported tables as conservatively non-stable.
+    for (_, entity_index) in &translation.module.exports {
+        if let EntityIndex::Table(table_index) = entity_index {
+            translation.module.tables_mutated[*table_index] = true;
+        }
+    }
+
+    // Walk every defined function body and look for table-mutation opcodes.
+    // The cost is O(total opcodes), one extra pass on top of the validator;
+    // typical large modules (sqlite3 ~50K opcodes) take well under a
+    // millisecond.
+    for (_, body_data) in &translation.function_body_inputs {
+        let mut reader = body_data.body.get_operators_reader()?;
+        while !reader.eof() {
+            use wasmparser::Operator;
+            match reader.read()? {
+                Operator::TableSet { table }
+                | Operator::TableFill { table }
+                | Operator::TableGrow { table } => {
+                    translation.module.tables_mutated[TableIndex::from_u32(table)] = true;
+                }
+                Operator::TableCopy {
+                    dst_table,
+                    src_table: _,
+                } => {
+                    // `src_table` is read-only in `table.copy`; only the
+                    // destination is mutated.
+                    translation.module.tables_mutated[TableIndex::from_u32(dst_table)] = true;
+                }
+                Operator::TableInit {
+                    table,
+                    elem_index: _,
+                } => {
+                    translation.module.tables_mutated[TableIndex::from_u32(table)] = true;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Leftover active `elem` segments — anything `try_func_table_init`
+    // couldn't fold into `precomputed`. These run at instantiation time
+    // *after* the precomputed image has been applied and can overwrite
+    // any slot in their target table with arbitrary funcrefs (different
+    // signature, null, ...). Mark each target table as mutated so the
+    // downstream call_indirect elisions correctly bail out — they all
+    // read from `precomputed` and assume it's authoritative for the
+    // lifetime of any instance, which leftover segments invalidate.
+    //
+    // No-op if `try_func_table_init` cleared the segments list, which
+    // is the common case for compiler-emitted wasm (constant-offset
+    // Functions-form segments). Witness for the bug this guards
+    // against: a second elem segment with `(offset (global.get $g))`
+    // for the same table — dynamic offsets force the segment to stay
+    // in the segments list (see `try_func_table_init`).
+    for segment in translation.module.table_initialization.segments.iter() {
+        translation.module.tables_mutated[segment.table_index] = true;
+    }
+
+    Ok(())
 }
