@@ -1801,7 +1801,13 @@ impl FuncEnvironment<'_> {
             self.reference_type(table.ref_type.heap_type).0.bytes()
         };
 
-        let base_flags = if Some(table.limits.min) == table.limits.max {
+        // A table whose size never changes has a constant base and bound.
+        // That holds when it is declared non-growable, or when it is never
+        // imported, exported, or mutated.
+        let fixed_size = Some(table.limits.min) == table.limits.max
+            || self.translation.table_is_immutable(index);
+
+        let base_flags = if fixed_size {
             func.dfg
                 .mem_flags
                 .insert(MemFlagsData::trusted().with_readonly().with_can_move())
@@ -1817,7 +1823,7 @@ impl FuncEnvironment<'_> {
             flags: base_flags,
         });
 
-        let bound = if Some(table.limits.min) == table.limits.max {
+        let bound = if fixed_size {
             TableSize::Static {
                 bound: table.limits.min,
             }

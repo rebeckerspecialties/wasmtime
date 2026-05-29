@@ -20,8 +20,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use wasmparser::{
     CustomSectionReader, DataKind, ElementItems, ElementKind, Encoding, ExternalKind,
-    FuncToValidate, FunctionBody, KnownCustom, NameSectionReader, Naming, Parser, Payload, TypeRef,
-    Validator, ValidatorResources, types::Types,
+    FuncToValidate, FunctionBody, KnownCustom, NameSectionReader, Naming, Operator, Parser, Payload,
+    TypeRef, Validator, ValidatorResources, types::Types,
 };
 
 /// Object containing the standalone environment information.
@@ -112,6 +112,13 @@ pub struct ModuleTranslation<'data> {
     /// which function is currently being defined.
     code_index: u32,
 
+    /// Per-table flag set when a table is imported, exported, or the
+    /// destination of a `table.{set,fill,copy,grow,init}` in any defined
+    /// function. When `false` the table's size and contents are fixed for
+    /// the lifetime of an instance. Computed by
+    /// [`ModuleTranslation::analyze_table_mutability`].
+    pub tables_mutated: SecondaryMap<TableIndex, bool>,
+
     /// The type information of the current module made available at the end of the
     /// validation process.
     types: Option<Types>,
@@ -198,6 +205,7 @@ impl<'data> ModuleTranslation<'data> {
             data_align: None,
             runtime_data: Default::default(),
             code_index: 0,
+            tables_mutated: SecondaryMap::default(),
             types: None,
             runtime_data_map: Default::default(),
             passive_elem_map: Default::default(),
@@ -1368,6 +1376,72 @@ impl ModuleTranslation<'_> {
         self.data_align = Some(page_size);
         self.module.memory_initialization = MemoryInitialization::Static { map };
         self.memory_init = MemoryInit::Processed(new_initializers);
+    }
+
+    /// Populates [`ModuleTranslation::tables_mutated`].
+    ///
+    /// A table is marked when it is imported, exported, or the destination
+    /// of a `table.{set,fill,copy,grow,init}` in any defined function. An
+    /// unmarked table has a fixed size and contents for the lifetime of an
+    /// instance.
+    ///
+    /// Imports and exports are cheap to check; the scan over the code
+    /// section is skipped once every table is already marked.
+    pub fn analyze_table_mutability(&mut self) -> WasmResult<()> {
+        let num_tables = self.module.tables.len();
+        if num_tables == 0 {
+            return Ok(());
+        }
+
+        // Imported and exported tables are reachable through the embedder
+        // API, which can grow them or write their elements.
+        let num_imported = self.module.num_imported_tables;
+        for i in 0..num_imported {
+            self.tables_mutated[TableIndex::from_u32(i as u32)] = true;
+        }
+        for (_, entity) in &self.module.exports {
+            if let EntityIndex::Table(table_index) = entity {
+                self.tables_mutated[*table_index] = true;
+            }
+        }
+
+        // Nothing left for the opcode scan to discover; skip the code section.
+        let mut remaining = num_tables - self.tables_mutated.values().filter(|m| **m).count();
+        if remaining == 0 {
+            return Ok(());
+        }
+
+        for (_, body) in &self.function_body_inputs {
+            let mut reader = body.body.get_operators_reader()?;
+            while !reader.eof() {
+                let table = match reader.read()? {
+                    Operator::TableSet { table }
+                    | Operator::TableFill { table }
+                    | Operator::TableGrow { table }
+                    | Operator::TableInit { table, .. }
+                    | Operator::TableCopy {
+                        dst_table: table, ..
+                    } => table,
+                    _ => continue,
+                };
+                let table = TableIndex::from_u32(table);
+                if !self.tables_mutated[table] {
+                    self.tables_mutated[table] = true;
+                    remaining -= 1;
+                    if remaining == 0 {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns `true` if `index`'s size and contents are fixed for the
+    /// lifetime of an instance. Requires [`Self::analyze_table_mutability`]
+    /// to have run.
+    pub fn table_is_immutable(&self, index: TableIndex) -> bool {
+        !self.tables_mutated[index]
     }
 
     /// Finalizes the initialization of tables.
